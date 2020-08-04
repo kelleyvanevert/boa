@@ -17,7 +17,7 @@ use crate::{
     builtins::{
         function::Function,
         map::ordered_map::OrderedMap,
-        property::Property,
+        property::{Property, PropertyKey},
         value::{RcBigInt, RcString, RcSymbol, Value},
         BigInt, Date, RegExp,
     },
@@ -36,8 +36,10 @@ pub use internal_state::{InternalState, InternalStateCell};
 pub mod gcobject;
 pub mod internal_methods;
 mod internal_state;
+mod iter;
 
 pub use gcobject::GcObject;
+pub use iter::*;
 
 #[cfg(test)]
 mod tests;
@@ -53,10 +55,11 @@ pub static PROTOTYPE: &str = "prototype";
 pub struct Object {
     /// The type of the object.
     pub data: ObjectData,
+    indexed_properties: FxHashMap<u32, Property>,
     /// Properties
-    properties: FxHashMap<RcString, Property>,
+    pub(crate) properties: FxHashMap<RcString, Property>,
     /// Symbol Properties
-    symbol_properties: FxHashMap<u32, Property>,
+    symbol_properties: FxHashMap<RcSymbol, Property>,
     /// Instance prototype `__proto__`.
     prototype: Value,
     /// Some rust object that stores internal state
@@ -113,6 +116,7 @@ impl Default for Object {
     fn default() -> Self {
         Self {
             data: ObjectData::Ordinary,
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
@@ -134,6 +138,7 @@ impl Object {
 
         Self {
             data: ObjectData::Function(function),
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype,
@@ -159,6 +164,7 @@ impl Object {
     pub fn boolean(value: bool) -> Self {
         Self {
             data: ObjectData::Boolean(value),
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
@@ -171,6 +177,7 @@ impl Object {
     pub fn number(value: f64) -> Self {
         Self {
             data: ObjectData::Number(value),
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
@@ -186,6 +193,7 @@ impl Object {
     {
         Self {
             data: ObjectData::String(value.into()),
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
@@ -198,6 +206,7 @@ impl Object {
     pub fn bigint(value: RcBigInt) -> Self {
         Self {
             data: ObjectData::BigInt(value),
+            indexed_properties: FxHashMap::default(),
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
@@ -398,26 +407,6 @@ impl Object {
     #[inline]
     pub fn is_ordinary(&self) -> bool {
         matches!(self.data, ObjectData::Ordinary)
-    }
-
-    #[inline]
-    pub fn properties(&self) -> &FxHashMap<RcString, Property> {
-        &self.properties
-    }
-
-    #[inline]
-    pub fn properties_mut(&mut self) -> &mut FxHashMap<RcString, Property> {
-        &mut self.properties
-    }
-
-    #[inline]
-    pub fn symbol_properties(&self) -> &FxHashMap<u32, Property> {
-        &self.symbol_properties
-    }
-
-    #[inline]
-    pub fn symbol_properties_mut(&mut self) -> &mut FxHashMap<u32, Property> {
-        &mut self.symbol_properties
     }
 
     #[inline]

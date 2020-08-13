@@ -74,12 +74,13 @@ impl Json {
         holder: &mut Value,
         key: Value,
     ) -> Result<Value> {
-        let mut value = holder.get_field(key.clone());
+        let value = holder.get_field(key.clone());
 
-        let obj = value.as_object().as_deref().cloned();
-        if let Some(obj) = obj {
-            for key in obj.properties().keys() {
-                let v = Self::walk(reviver, ctx, &mut value, Value::from(key.as_str()));
+        if let Value::Object(ref object) = value {
+            let keys: Vec<_> = object.borrow().properties().keys().cloned().collect();
+
+            for key in keys {
+                let v = Self::walk(reviver, ctx, &mut value.clone(), Value::from(key.as_str()));
                 match v {
                     Ok(v) if !v.is_undefined() => {
                         value.set_field(key.as_str(), v);

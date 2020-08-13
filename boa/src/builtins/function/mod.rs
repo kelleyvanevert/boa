@@ -93,14 +93,14 @@ unsafe impl Trace for FunctionBody {
 
 bitflags! {
     #[derive(Finalize, Default)]
-    struct FunctionFlags: u8 {
+    pub(crate) struct FunctionFlags: u8 {
         const CALLABLE = 0b0000_0001;
         const CONSTRUCTABLE = 0b0000_0010;
     }
 }
 
 impl FunctionFlags {
-    fn from_parameters(callable: bool, constructable: bool) -> Self {
+    pub(crate) fn from_parameters(callable: bool, constructable: bool) -> Self {
         let mut flags = Self::default();
 
         if callable {
@@ -142,7 +142,7 @@ pub struct Function {
     // Environment, built-in functions don't need Environments
     pub environment: Option<Environment>,
     /// Is it constructable or
-    flags: FunctionFlags,
+    pub(crate) flags: FunctionFlags,
 }
 
 impl Function {

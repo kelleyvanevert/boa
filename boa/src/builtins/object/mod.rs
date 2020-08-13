@@ -17,7 +17,7 @@ use crate::{
     builtins::{
         function::Function,
         map::ordered_map::OrderedMap,
-        property::Property,
+        property::{Attribute, Property},
         value::{RcBigInt, RcString, RcSymbol, Value},
         BigInt, Date, RegExp,
     },
@@ -26,16 +26,15 @@ use crate::{
 };
 use gc::{Finalize, Trace};
 use rustc_hash::FxHashMap;
+use std::any::Any;
 use std::fmt::{Debug, Display, Error, Formatter};
 use std::result::Result as StdResult;
 
-use super::function::{make_builtin_fn, make_constructor_fn};
+use super::function::{make_builtin_fn, make_constructor_fn, FunctionFlags, NativeFunctionData};
 use crate::builtins::value::same_value;
-pub use internal_state::{InternalState, InternalStateCell};
 
 pub mod gcobject;
 pub mod internal_methods;
-mod internal_state;
 
 pub use gcobject::GcObject;
 
@@ -45,11 +44,164 @@ mod tests;
 /// Static `prototype`, usually set on constructors as a key to point to their respective prototype object.
 pub static PROTOTYPE: &str = "prototype";
 
-// /// Static `__proto__`, usually set on Object instances as a key to point to their respective prototype object.
-// pub static INSTANCE_PROTOTYPE: &str = "__proto__";
+pub trait NativeObject: Debug + Any + Trace {
+    fn as_any(&self) -> &dyn Any;
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Any + Debug + Trace> NativeObject for T {
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self as &mut dyn Any
+    }
+}
+
+pub trait Class: NativeObject {
+    /// The binding name of the object.
+    const NAME: &'static str;
+    /// The amount of arguments the class `constructor` takes.
+    const LENGTH: usize = 0;
+
+    /// This is a wrapper around `Self::constructor` that sets the internal data of the class.
+    fn raw_constructor(this: &Value, args: &[Value], ctx: &mut Interpreter) -> Result<Value>
+    where
+        Self: Sized,
+    {
+        let object_instance = Self::constructor(this, args, ctx)?;
+        this.set_data(ObjectData::NativeObject(Box::new(object_instance)));
+        Ok(this.clone())
+    }
+
+    /// The constructor of the class.
+    fn constructor(this: &Value, args: &[Value], ctx: &mut Interpreter) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Initializes the internals and the methods of the class.
+    fn methods(class: &mut ClassBuilder<'_>) -> Result<()>;
+}
+
+/// Class builder which allows adding methods and static methods to the class.
+#[derive(Debug)]
+pub struct ClassBuilder<'context> {
+    context: &'context mut Interpreter,
+    object: GcObject,
+    prototype: GcObject,
+}
+
+impl<'context> ClassBuilder<'context> {
+    pub(crate) fn new<T>(context: &'context mut Interpreter) -> Self
+    where
+        T: Class,
+    {
+        let global = context.global();
+
+        let prototype = {
+            let object_prototype = global.get_field("Object").get_field(PROTOTYPE);
+
+            let object = Object::create(object_prototype);
+            GcObject::new(object)
+        };
+        // Create the native function
+        let mut function = Function::builtin(Vec::new(), T::raw_constructor);
+        function.flags = FunctionFlags::from_parameters(false, true);
+
+        // Get reference to Function.prototype
+        // Create the function object and point its instance prototype to Function.prototype
+        let mut constructor =
+            Object::function(function, global.get_field("Function").get_field(PROTOTYPE));
+
+        let length = Property::data_descriptor(
+            T::LENGTH.into(),
+            Attribute::READONLY | Attribute::NON_ENUMERABLE | Attribute::PERMANENT,
+        );
+        constructor.insert_property("length", length);
+
+        let name = Property::data_descriptor(
+            T::NAME.into(),
+            Attribute::READONLY | Attribute::NON_ENUMERABLE | Attribute::PERMANENT,
+        );
+        constructor.insert_property("name", name);
+
+        let constructor = GcObject::new(constructor);
+
+        prototype
+            .borrow_mut()
+            .insert_field("constructor", constructor.clone().into());
+
+        constructor
+            .borrow_mut()
+            .insert_field(PROTOTYPE, prototype.clone().into());
+
+        Self {
+            context,
+            object: constructor,
+            prototype,
+        }
+    }
+
+    pub(crate) fn build(self) -> GcObject {
+        self.object
+    }
+
+    /// Add a method to the class.
+    ///
+    /// It is added to `prototype`.
+    pub fn method<N>(&mut self, name: N, length: usize, function: NativeFunctionData)
+    where
+        N: Into<String>,
+    {
+        let name = name.into();
+        let mut function = Object::function(
+            Function::builtin(Vec::new(), function),
+            self.context
+                .global()
+                .get_field("Function")
+                .get_field("prototype"),
+        );
+
+        function.insert_field("length", Value::from(length));
+        function.insert_field("name", Value::from(name.as_str()));
+
+        self.prototype
+            .borrow_mut()
+            .insert_field(name, Value::from(function));
+    }
+
+    /// Add a static method to the class.
+    ///
+    /// It is added to class object itself.
+    pub fn static_method<N>(&mut self, name: N, length: usize, function: NativeFunctionData)
+    where
+        N: Into<String>,
+    {
+        let name = name.into();
+        let mut function = Object::function(
+            Function::builtin(Vec::new(), function),
+            self.context
+                .global()
+                .get_field("Function")
+                .get_field("prototype"),
+        );
+
+        function.insert_field("length", Value::from(length));
+        function.insert_field("name", Value::from(name.as_str()));
+
+        self.object
+            .borrow_mut()
+            .insert_field(name, Value::from(function));
+    }
+
+    pub fn context(&mut self) -> &'_ mut Interpreter {
+        self.context
+    }
+}
 
 /// The internal representation of an JavaScript object.
-#[derive(Debug, Trace, Finalize, Clone)]
+#[derive(Debug, Trace, Finalize)]
 pub struct Object {
     /// The type of the object.
     pub data: ObjectData,
@@ -59,14 +211,12 @@ pub struct Object {
     symbol_properties: FxHashMap<u32, Property>,
     /// Instance prototype `__proto__`.
     prototype: Value,
-    /// Some rust object that stores internal state
-    state: Option<InternalStateCell>,
     /// Whether it can have new properties added to it.
     extensible: bool,
 }
 
 /// Defines the different types of objects.
-#[derive(Debug, Trace, Finalize, Clone)]
+#[derive(Debug, Trace, Finalize)]
 pub enum ObjectData {
     Array,
     Map(OrderedMap<Value, Value>),
@@ -81,6 +231,7 @@ pub enum ObjectData {
     Ordinary,
     Date(Date),
     Global,
+    NativeObject(Box<dyn NativeObject>),
 }
 
 impl Display for ObjectData {
@@ -102,6 +253,7 @@ impl Display for ObjectData {
                 Self::BigInt(_) => "BigInt",
                 Self::Date(_) => "Date",
                 Self::Global => "Global",
+                Self::NativeObject(_) => "NativeObject",
             }
         )
     }
@@ -116,7 +268,6 @@ impl Default for Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
-            state: None,
             extensible: true,
         }
     }
@@ -137,7 +288,6 @@ impl Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype,
-            state: None,
             extensible: true,
         }
     }
@@ -162,7 +312,6 @@ impl Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
-            state: None,
             extensible: true,
         }
     }
@@ -174,7 +323,6 @@ impl Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
-            state: None,
             extensible: true,
         }
     }
@@ -189,7 +337,6 @@ impl Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
-            state: None,
             extensible: true,
         }
     }
@@ -201,26 +348,20 @@ impl Object {
             properties: FxHashMap::default(),
             symbol_properties: FxHashMap::default(),
             prototype: Value::null(),
-            state: None,
             extensible: true,
         }
     }
 
-    /// Converts the `Value` to an `Object` type.
-    ///
-    /// More information:
-    ///  - [ECMAScript reference][spec]
-    ///
-    /// [spec]: https://tc39.es/ecma262/#sec-toobject
-    pub fn from(value: &Value) -> StdResult<Self, ()> {
-        match *value {
-            Value::Boolean(a) => Ok(Self::boolean(a)),
-            Value::Rational(a) => Ok(Self::number(a)),
-            Value::Integer(a) => Ok(Self::number(f64::from(a))),
-            Value::String(ref a) => Ok(Self::string(a.clone())),
-            Value::BigInt(ref bigint) => Ok(Self::bigint(bigint.clone())),
-            Value::Object(ref obj) => Ok(obj.borrow().clone()),
-            _ => Err(()),
+    pub fn native_object<T>(value: T) -> Self
+    where
+        T: NativeObject,
+    {
+        Self {
+            data: ObjectData::NativeObject(Box::new(value)),
+            properties: FxHashMap::default(),
+            symbol_properties: FxHashMap::default(),
+            prototype: Value::null(),
+            extensible: true,
         }
     }
 
@@ -420,16 +561,6 @@ impl Object {
         &mut self.symbol_properties
     }
 
-    #[inline]
-    pub fn state(&self) -> &Option<InternalStateCell> {
-        &self.state
-    }
-
-    #[inline]
-    pub fn state_mut(&mut self) -> &mut Option<InternalStateCell> {
-        &mut self.state
-    }
-
     pub fn prototype(&self) -> &Value {
         &self.prototype
     }
@@ -438,20 +569,56 @@ impl Object {
         assert!(prototype.is_null() || prototype.is_object());
         self.prototype = prototype
     }
+
+    pub fn is_native_object(&self) -> bool {
+        matches!(self.data, ObjectData::NativeObject(_))
+    }
+
+    pub fn is<T>(&self) -> bool
+    where
+        T: NativeObject,
+    {
+        use std::ops::Deref;
+        match self.data {
+            ObjectData::NativeObject(ref object) => object.deref().as_any().is::<T>(),
+            _ => false,
+        }
+    }
+
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: NativeObject,
+    {
+        use std::ops::Deref;
+        match self.data {
+            ObjectData::NativeObject(ref object) => object.deref().as_any().downcast_ref::<T>(),
+            _ => None,
+        }
+    }
+
+    pub fn downcast_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: NativeObject,
+    {
+        use std::ops::DerefMut;
+        match self.data {
+            ObjectData::NativeObject(ref mut object) => {
+                object.deref_mut().as_mut_any().downcast_mut::<T>()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Create a new object.
 pub fn make_object(_: &Value, args: &[Value], ctx: &mut Interpreter) -> Result<Value> {
     if let Some(arg) = args.get(0) {
         if !arg.is_null_or_undefined() {
-            return Ok(Value::object(Object::from(arg).unwrap()));
+            return arg.to_object(ctx);
         }
     }
-    let global = &ctx.realm.global_obj;
 
-    let object = Value::new_object(Some(global));
-
-    Ok(object)
+    Ok(Value::new_object(Some(ctx.global())))
 }
 
 /// `Object.create( proto, [propertiesObject] )`

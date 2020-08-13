@@ -26,7 +26,7 @@ use crate::{
     builtins,
     builtins::{
         function::{Function as FunctionObject, FunctionBody, ThisMode},
-        object::{Object, ObjectData, PROTOTYPE},
+        object::{Class, ClassBuilder, Object, ObjectData, PROTOTYPE},
         property::PropertyKey,
         value::{PreferredType, Type, Value},
         Console,
@@ -106,7 +106,7 @@ impl Interpreter {
 
     /// Retrieves the global object of the `Realm` of this executor.
     #[inline]
-    pub(crate) fn global(&self) -> &Value {
+    pub fn global(&self) -> &Value {
         &self.realm.global_obj
     }
 
@@ -350,6 +350,18 @@ impl Interpreter {
     /// A helper function for getting a mutable reference to the `console` object.
     pub(crate) fn console_mut(&mut self) -> &mut Console {
         &mut self.console
+    }
+
+    pub fn register_global_class<T>(&mut self) -> Result<()>
+    where
+        T: Class,
+    {
+        let mut class_builder = ClassBuilder::new::<T>(self);
+        T::methods(&mut class_builder)?;
+
+        let class = class_builder.build();
+        self.global().set_field(T::NAME, class);
+        Ok(())
     }
 }
 
